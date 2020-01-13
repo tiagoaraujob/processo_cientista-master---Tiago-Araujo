@@ -76,7 +76,7 @@ plot_density_pred = function(mod,test){
 
 Leitura dos dados
 ```{r message=F, waning=F}
-setwd("./processo_cientista-master/data")
+setwd("./data")
 rain_data <- read_csv("rain_data_aus.csv", 
                         col_types = cols(evaporation = col_double(), 
                         sunshine = col_double()))
