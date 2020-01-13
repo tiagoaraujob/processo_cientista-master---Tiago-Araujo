@@ -1,0 +1,1135 @@
+---
+title: "Case Itau"
+author: "Tiago Araujo"
+date: "1/6/2020"
+output: 
+  html_document:
+    toc: true
+    theme: united
+    toc_depth: 3
+    fig_width: 12
+    fig_height: 10 
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Libs e utils
+```{r message=F}
+library(tidyverse)
+library(factoextra)
+library(lubridate)
+library(caret)
+library(leaflet)
+library(viridisLite)
+library(gridExtra)
+library(ggpubr)
+library(corrplot)
+library(ROCR)
+
+getmode <- function(v) {
+   uniqv <- unique(v[which(!is.na(v))])
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+elbow <- function(data,k.max){
+wss <- sapply(1:k.max, 
+              function(k){kmeans(data, k, nstart=50,iter.max = 15 )$tot.withinss})
+print(plot(1:k.max, wss,
+     type="b", pch = 19, frame = FALSE, 
+     xlab="Number of clusters K",
+     ylab="Total within-clusters sum of squares"))
+
+}
+
+rocp = function(mod,test,y_test){
+
+pred = predict(mod,test,"prob")[,2]    
+p = prediction(pred,y_test)
+perf = performance(p,measure = "tpr", x.measure = "fpr")
+
+
+print(plot(perf,main = "ROC Curve"))
+
+auc.perf = performance(p, measure = "auc")
+return (auc.perf@y.values)
+}
+
+plot_density_pred = function(mod,test){
+  pred = predict(mod,test,"prob")
+  pred = cbind(pred,raintomorrow=test$raintomorrow)
+  names(pred)[1:2] = c("No","Yes")
+  print(ggplot(pred,aes(Yes,col=raintomorrow)) + geom_density() + theme_bw() + ggtitle("Distribuição das probabilidades preditas de Yes"))
+  
+}
+
+
+
+
+```
+
+</br>
+
+Leitura dos dados
+```{r message=F, waning=F}
+setwd("./processo_cientista-master/data")
+rain_data <- read_csv("rain_data_aus.csv", 
+                        col_types = cols(evaporation = col_double(), 
+                        sunshine = col_double()))
+
+for(i in 1:8){
+        file = paste0("wind_table_0",i,".csv")
+        if(i==1){
+                wind_data = read_csv(file)
+                cols = names(wind_data)
+        }
+        else{
+                aux = read_csv(file)
+                names(aux) = cols
+                wind_data = rbind(wind_data,aux)
+        }
+}
+
+coords = read_csv("city_coord.csv")
+```
+# Introdução
+
+O problema consiste em prever se irá ou não chover no dia seguinte. Os dados estão divididos em duas bases diferentes uma delas lida com informações metereologicas mais gerais e a outra com informações específicas sobre os ventos, inicialmente elas serão tratadas individualmente, mas eventualmente serão unidas.
+
+## Dados Chuvas
+</br>
+Para a base de dados sobre a chuva, ela possui `r nrow(rain_data)` observações e `r ncol(rain_data)` variáveis que são:
+
+```{r echo=F}
+
+names(rain_data)
+
+```
+A variável resposta é *raintomorrow*.\
+
+Inicialmente convertendo as colunas do tipo character para factor e validando os demais formatos, também removendo a coluna com as probabilidades do modelo vigente.
+```{r}
+rain_data = rain_data %>% mutate_if(is.character, as.factor)
+rain_data = rain_data %>% select(-modelo_vigente)
+summary(rain_data)
+
+```
+
+Pode-se notar um grande número de valores faltantes.
+
+```{r, include=F}
+
+total_rain = nrow(rain_data)*ncol(rain_data)
+prop_na_rain = round((sum(is.na(rain_data))/total_rain) * 100,2)
+
+paste0(prop_na_rain,"%") #% porcentagem dos dados faltantes
+
+```
+
+Aproximadamente `r paste0(prop_na_rain,"%")` dos valores da tabela são faltantes, isso será discutido mais a frente.\
+
+## Dados Ventos
+
+Já a outra base de dados, que lida com informações específicas sobre o vento numa localidade específica e uma data específica, possui `r nrow(wind_data)` observações e `r ncol(wind_data)` variáveis que são: 
+
+```{r echo=F}
+
+names(wind_data)
+
+```
+
+</br>
+Corrigindo os campos character para factor e validando os demais tipos
+```{r}
+
+wind_data = wind_data %>% mutate_if(is.character, as.factor)
+
+summary(wind_data)
+```
+
+```{r echo=F, include=F}
+
+total_wind = nrow(wind_data)*ncol(wind_data)
+prop_na_wind = round((sum(is.na(wind_data))/total_wind) * 100,2)
+
+paste0(prop_na_wind,"%") #% dos dados faltantes
+
+```
+</br>
+
+Já para esses dados os valores faltantes correspondem à `r paste0(prop_na_wind,"%")` das observações, valor menor que da base de chuvas.
+
+# Análise Exploratória
+
+## Dados Chuvas 
+
+```{r include=F}
+
+names_numerical_columns = names(rain_data)[unlist(lapply(rain_data, is.numeric))]
+names_categorical_columns = names(rain_data)[unlist(lapply(rain_data, is.factor))]
+
+length(names_numerical_columns) #colunas numéricas
+length(names_categorical_columns) #categóricas
+
+```
+
+Dentro dos dados de chuva existem `r length(names_numerical_columns)` colunas numéricas, `r length(names_categorical_columns)` categóricas e uma de data, que serão avaliadas a seguir.
+
+
+### Variáveis Categóricas
+
+#### raintomorrow
+
+Essa é a variável resposta do problema, como é possível notar ela está distribuida de maneira bastante desbalanceada entre os seus possíveis resultados, o que demanda algumas mudanças na hora do desenvolvimento do modelo.
+```{r}
+
+ggplot(rain_data,aes(raintomorrow)) + geom_bar() + theme_bw() + ylab("Contagem")
+
+
+```
+
+#### raintoday
+Essa varíavel discrimina se no dia de hoje teve-se algum relato de chuva ou não
+```{r}
+p1 = ggplot(rain_data,aes(raintoday)) + geom_bar()+ theme_bw() + ylab("Contagem")
+p2=ggplot(rain_data,aes(raintoday, fill = raintomorrow)) + geom_bar(position = "dodge") + theme_bw() + ylab("Contagem")
+
+grid.arrange(p1,p2,ncol=1)
+
+```
+</br>
+
+É possível notar que nos dias que choveu a proporção de vezes que choveu no dia seguinte é muito maior.
+
+```{r}
+
+prop.table(table(Choveu.Hoje = rain_data$raintoday, Chove.Amanha = rain_data$raintomorrow),margin = 1)
+
+```
+
+#### location
+Localidade da medição, quase todas elas possuem a mesma frequência nos dados com exceção de Hobart, Nhil e Tuggeranong que distoam mais.
+```{r}
+
+p1 = ggplot(rain_data,aes(location)) + geom_bar() + theme_bw() + ylab("Contagem") + theme(axis.text.x = element_text(angle = 90))
+
+p2 = rain_data %>% group_by(location,raintomorrow) %>% summarise(total = n()) %>% mutate(Proporcao=total/sum(total)) %>% 
+ggplot(aes(x=location,y=Proporcao, fill = raintomorrow)) + geom_bar(position = "dodge",stat="identity") + theme_bw() + ylab("Proporção") + theme(axis.text.x = element_text(angle = 90))
+
+grid.arrange(p1,p2)
+
+```
+É notavel também que a proporção vezes que choveu no dia seguinte varia bastante entre as localidades, discriminando bem a variável resposta.\
+
+O Volume médio de chuva possui uma variação considerável levando em conta as localidades.
+```{r}
+
+rain_data %>% filter(raintoday == "Yes") %>% group_by(location) %>% summarise(Media_Volume_Chuva = mean(amountOfRain)) %>% 
+  ggplot(aes(location,Media_Volume_Chuva)) + geom_bar(stat="Identity") + theme_bw() + ggtitle("Média do volume de chuvas por localidade") + theme(axis.text.x = element_text(angle = 90))
+
+
+```
+
+### Variáveis Numéricas
+
+#### amountOfRain
+Variável que mede a quantidade de chuva, entretanto sem informação se é sobre o dia atual ou o próximo.
+```{r}
+
+
+
+ggplot(rain_data,aes(amountOfRain,col=raintomorrow)) + geom_density() + theme_bw()
+
+
+```
+
+```{r}
+
+aux = rain_data %>% select(amountOfRain,raintomorrow) %>% mutate(Zero_chuva = ifelse(amountOfRain==0,1,0),
+                                                                 raintomorrow = ifelse(raintomorrow=='Yes',1,0))
+
+table(Zero_Chuva = aux$Zero_chuva, Chove_Amanha = aux$raintomorrow)
+
+
+
+```
+Ou seja para os dias com amountOfRain = 0, 100% das vezes não choverá amanhã. Variável nao será utilizada para a modelagem pois muito provavelmente se refere à algum evento futuro.
+
+
+
+
+Variáveis com muitos outliers: rainfall, evaporation, amountofrain.
+
+As outras variáveis mostram um comportamento mais controlado, tendo a mediana como centro dos dados.
+```{r warning=F}
+
+rain_data = rain_data %>% mutate(Dia = as.factor(day(date)), 
+                                 Mes = as.factor(month(date)),
+                                 Ano = as.factor(year(date)))
+
+
+plots = list()
+plots_resp = list()
+i=1
+for (col in names_numerical_columns) {
+  p = ggplot(rain_data,aes_string(x="1",y=col))+geom_boxplot() +theme_bw() + ggtitle(col)
+  p2 = ggplot(rain_data,aes_string(col,col="raintomorrow")) + geom_density() + theme_bw() + ggtitle(col)
+  plots[[i]] = p
+  plots_resp[[i]] = p2
+  i = i+1
+}
+
+x = length(plots)
+
+cols = round(sqrt(x),0)
+rows = ceiling(x/cols)
+
+ggarrange(plotlist = plots, ncol=cols, nrow = rows)
+
+```
+
+Comportamento das variáveis numéricas realizando a separação pela variável resposta
+
+```{r warning = F}
+
+ggarrange(plotlist = plots_resp, ncol=cols, nrow = rows)
+
+
+```
+Individualmente nenhuma das variáveis possuiria um bom desempenho para dizer se chove ou não amanhã, entretanto algumas variáveis acabam chamando atenção como sunshine, nos dias onde essa variável mostra valores mais altos existe uma tendência à não chover no dia seguinte ou humidity3pm onde valores mais baixos mostram também a mesma tendência, entre outras.
+
+```{r}
+
+corr = cor(rain_data[,names_numerical_columns], use = "complete.obs")
+
+corrplot(corr,'number')
+```
+Pode-se notar algumas correlações altas esperadas como temperatura minima e a temperatura da as 9 da manhã e a quantidade de horas de sol com a quantidade de nuvens no céu, outros pontos são:\
+
+* umidade e a umidade medida as 3 da tarde mostram uma forte correlação também, indicando que a médida de umidade normalmente foi feita na parte da tarde, o mesmo para a temperatura.
+
+* umidade 9 da manhã e das 3 tarde possuem média correlação indicando que essa medida não se altera muito ao longo do dia.
+
+* umidade e a quantidade de horas de sol possuem uma correlação média.
+
+* a variável que mede evaporação com a temperatura possuem uma correlação média
+
+</br>
+
+### Variável Data
+
+```{r}
+
+rain_data = rain_data %>% mutate(Ano = as.factor(year(date)),
+                                 Mes = as.factor(month(date)),
+                                 Dia = as.factor(day(date)),
+                                 Week = as.factor(week(date)))
+
+p1 = rain_data %>% group_by(Ano) %>% summarise(Qtd_Chuva = sum(rainfall,na.rm = T)) %>% 
+                ggplot(aes(x=Ano,y=Qtd_Chuva,group=1)) + geom_line() + theme_bw() + theme(axis.text.x = element_text(angle = 90)) 
+
+
+p2 = rain_data %>% group_by(Ano,Mes) %>% arrange(Ano,Mes) %>% summarise(Qtd_Chuva = sum(rainfall,na.rm = T)) %>% 
+              ggplot(aes(x=Mes,y=Qtd_Chuva,group=factor(Ano),col=factor(Ano))) + geom_line() + theme_bw() + theme(axis.text.x = element_text(angle = 90)) 
+
+p3 = rain_data %>% group_by(Ano,Week) %>% arrange(Ano,Week) %>% summarise(Qtd_Chuva = sum(rainfall,na.rm = T)) %>% 
+              ggplot(aes(x=Week,y=Qtd_Chuva,group=factor(Ano),col=factor(Ano))) + geom_line() + theme_bw() + theme(axis.text.x = element_text(angle = 90))
+
+grid.arrange(p1,p2,p3,ncol=1)
+
+
+```
+Aparentemente não existe nenhum tipo de padrão ao longo dos anos nos dados.
+
+```{r warning=F}
+
+rain_data %>% group_by(Ano,Mes) %>% count() %>% mutate (AnoMes = factor(paste0(Ano,'-',Mes))) %>% 
+                ggplot(aes(x=AnoMes,y=n)) + geom_bar(stat="identity") + theme_bw() + theme(axis.text.x = element_text(angle = 90)) 
+
+
+```
+Com exceção do período 2007/11 - 2008/09 as quantidades das medidas são muito próximas entre os meses
+
+
+Existe diferença na proporção das vezes que choveu em cada um dos meses
+```{r}
+
+
+rain_data %>% group_by(Mes) %>% mutate(choveu = ifelse(raintoday=='Yes',1,0)) %>% summarise(prop_1 = sum(choveu, na.rm = T), freq = n()) %>% mutate (prop = prop_1/freq) %>% ggplot(aes(x=Mes,y=prop)) + geom_bar(stat="identity") + theme_bw() + theme(axis.text.x = element_text(angle = 90)) 
+prop.table(table(rain_data$Mes,rain_data$raintomorrow),margin=1)
+
+```
+Teste chi quadrado para verificar se os grupos são estatisticamente diferentes, obtendo um p-valor de quase zero, confirmando a hipótese de efeito da variável mês.
+```{r}
+
+chisq.test(rain_data$Mes,rain_data$raintomorrow)
+
+
+
+```
+
+## Dados Ventos
+
+```{r,include=F}
+
+numerical_columns_wind = names(wind_data)[unlist(lapply(wind_data, is.numeric))]
+categorical_columns_wind = names(wind_data)[unlist(lapply(wind_data, is.factor))]
+
+```
+
+Dentro dos dados de chuva existem `r length(numerical_columns_wind)` colunas numéricas, `r length(categorical_columns_wind)` categóricas e uma de data, que serão avaliadas a seguir.
+
+### Variáveis categoricas
+
+Dentre as variáveis categóricas da base de ventos temos a que fala sobre a localidade da medição as outras três trazem informações sobre a direção que o vento vem.
+
+#### location
+
+A varíavel sobre a localização da medição, quase todas as localidade tiveram a praticamente mesma quantidade de medições com exceção de Hobart, Nhil e Uluru.
+```{r}
+wind_data %>% group_by(location) %>% count() %>% ggplot(aes(location,n)) + geom_bar(stat='identity') + theme_bw() + theme(axis.text.x = element_text(angle = 90))
+
+```
+
+#### Variáveis de direção do vento
+
+Existem 3 varíaveis que dizem a região que o vento está vindo: 
+
+* wind_gustdir: a direção do vento mais forte daquele dia
+* wind_dir9am: a direção do vento as 9 da manhã
+* wind_dir3pm: a direção do vento as 3 da tarde
+
+É possivel notar que existe diferença entre as proporções de dias que tiveram ou não chuva no dia seguinte dentre as direções dos ventos, entretanto os gráficos para as 3 variáveis são bastante parecidos. Entretanto a interação da variável de direção com a sua velocidade respectiva, possa ser importante no problema.
+
+Adicionando a variável resposta do problema para a construção de algumas visualizações
+```{r message=F, warning=F}
+
+wind_data = wind_data %>% left_join(rain_data %>% select(date,location,raintomorrow))
+
+wind_data %>% group_by(wind_gustdir,raintomorrow) %>% summarise(n = n()) %>% mutate(Proporcao = n/sum(n)) %>%  ggplot(aes(x=wind_gustdir,y=Proporcao,fill=raintomorrow)) + geom_bar(position = "dodge",stat='identity') + theme_bw() + ggtitle("wind_gustdir")
+
+wind_data %>% group_by(wind_dir9am,raintomorrow) %>% summarise(n = n()) %>% mutate(Proporcao = n/sum(n)) %>%  ggplot(aes(x=wind_dir9am,y=Proporcao,fill=raintomorrow)) + geom_bar(position = "dodge",stat='identity') + theme_bw() + ggtitle("wind_dir9am")
+
+wind_data %>% group_by(wind_dir3pm,raintomorrow) %>% summarise(n = n()) %>% mutate(Proporcao = n/sum(n)) %>%  ggplot(aes(x=wind_dir3pm,y=Proporcao,fill=raintomorrow)) + geom_bar(position = "dodge",stat='identity') + theme_bw() + ggtitle("wind_dir3pm")
+
+```
+
+### Variáveis Numéricas 
+
+Essas variáveis medem a velocidade do vento:
+
+* wind_gustspeed: a velocidade do vento mais forte daquele dia
+* wind_speed9am: a velocidade do vento as 9 da manhã
+* wind_speed3pm: a velocidade do vento as 3 da tarde
+</br>
+Todas estão com um número aceitável de outliers e a mediana parece bem centralizada próxima da média
+```{r warning=F}
+
+ggplot(wind_data,aes(x=1,wind_gustspeed)) + geom_boxplot() + theme_bw() + ggtitle("wind_gustspeed")
+ggplot(wind_data,aes(x=1,wind_speed9am)) + geom_boxplot() + theme_bw() + ggtitle("wind_speed9am")
+ggplot(wind_data,aes(x=1,wind_speed3pm)) + geom_boxplot() + theme_bw() + ggtitle("wind_speed3pm")
+
+
+```
+
+Relações com a variável resposta.
+```{r}
+
+ggplot(wind_data,aes(wind_gustspeed, col = raintomorrow)) + geom_density() + theme_bw() + ggtitle("wind_gustspeed")
+ggplot(wind_data,aes(wind_speed9am, col = raintomorrow)) + geom_density() + theme_bw() + ggtitle("wind_speed9am")
+ggplot(wind_data,aes(wind_speed3pm, col = raintomorrow)) + geom_density() + theme_bw() + ggtitle("wind_speed3pm")
+
+
+wind_data = wind_data %>% select(-raintomorrow)
+
+
+```
+wind_gustspeed é a que possui maior distinção entre as observações que chovem ou não no dia seguinte, mas nada muito conclusivo. Como foi dito anteriormente essa é uma avaliação da variável individualmente sem levar em conta interação com outras variáveis.
+
+# Feature Engineering e tratamento dos dados faltantes
+
+## Dados Chuvas
+
+Como visto anteriormente existem muitos valores faltantes na base de dados de chuvas.
+```{r}
+summary(rain_data)
+```
+
+Por início será utilizado a média mensal ao longo dos anos para dada localidade, entretanto para as variáveis citadas como com muitos outliers será utilizado a mediana.
+```{r warning=F}
+
+medias_mes_local = rain_data %>% group_by(location,Mes) %>%
+                   summarise_at(c(vars(mintemp:maxtemp,sunshine:temp3pm,temp,humidity),vars(rainfall,evaporation,amountOfRain)),funs(mean(.,na.rm = T), median(.,na.rm = T)))
+
+rain_data_clean_1 = rain_data %>% left_join(medias_mes_local, by = c("location","Mes")) %>% 
+        mutate(mintemp = coalesce(mintemp, mintemp_mean),
+               maxtemp = coalesce(maxtemp, maxtemp_mean),
+               rainfall = coalesce(rainfall, rainfall_median),
+               evaporation = coalesce(evaporation, evaporation_median),
+               sunshine = coalesce(sunshine, sunshine_mean),
+               humidity9am = coalesce(humidity9am, humidity9am_mean),
+               humidity3pm = coalesce(humidity3pm, humidity3pm_mean),
+               pressure9am = coalesce(pressure9am, pressure9am_mean),
+               pressure3pm = coalesce(pressure3pm, pressure3pm_mean),
+               cloud9am = coalesce(cloud9am, cloud9am_mean),
+               cloud3pm = coalesce(cloud3pm, cloud3pm_mean),
+               temp9am = coalesce(temp9am, temp9am_mean),
+               temp3pm = coalesce(temp3pm, temp3pm_mean),
+               temp = coalesce(temp, temp_mean),
+               humidity = coalesce(humidity, humidity_mean)) %>% select(-contains("mean"),-contains("median"))
+
+```
+
+Redução de quase 100 mil NA
+```{r}
+
+sum(is.na(rain_data_clean_1))
+
+```
+
+Os campos que continuam com NA, não obtiveram nenhuma medida da variável dentro daquela cidade no período todo 
+```{r}
+summary(rain_data_clean_1)
+```
+
+Para resolver isso será utilizado a média mensal de um grupo de localidades, construido a partir de uma análise de clusters. Como utilizarei os dados de ventos também para a construção desses clusters, irei tratá-los primeiro.
+
+## Dados Ventos
+
+Tratativa dos dados de vento para realizar um join com a tabela principal com intuito de obter mais informações para tratar os NA restantes.
+
+```{r}
+
+summary(wind_data)
+```
+
+Existem dias com mais de uma observação para a mesma cidade
+```{r}
+dup = wind_data %>% group_by(location,date) %>% count()
+
+table(dup$n)
+
+```
+
+As repetições são linhas duplicadas pois a quantidade de linhas duplicadas e do conjunto location/date que se repetem é a mesma
+```{r}
+
+sum(duplicated(wind_data))
+
+```
+
+Removendo as linhas duplicadas
+
+```{r}
+
+wind_data = wind_data[!duplicated(wind_data),]
+
+
+```
+
+Para os campos onde a velocidade do vento é zero, irei substituir a direção que possui NA por X
+```{r}
+
+wind_data = wind_data %>% mutate_if(is.factor, as.character)
+
+wind_data$wind_gustdir[wind_data$wind_gustspeed==0] = "X"
+wind_data$wind_dir9am[wind_data$wind_speed9am==0] = "X"
+wind_data$wind_dir3pm[wind_data$wind_speed3pm==0] = "X"
+
+wind_data = wind_data %>% mutate_if(is.character, as.factor)
+```
+
+```{r}
+
+summary(wind_data)
+
+```
+
+
+```{r}
+sum(is.na(wind_data))
+```
+
+
+Existem 2 cidades que não possuem nenhuma informação sobre wind_gustdir, logo não será possível utilizar a maior direção com maior frequência naquela região como substituição para esses casos.
+```{r}
+
+wind_data$location = as.factor(wind_data$location)
+wind_data$wind_gustdir = as.factor(wind_data$wind_gustdir)
+wind_data$wind_dir9am = as.factor(wind_data$wind_dir9am)
+wind_data$wind_dir3pm = as.factor(wind_data$wind_dir3pm)
+
+winddir_location_mes = wind_data %>% group_by(location,Mes = month(date)) %>% summarise_at(vars(contains("dir")),funs(getmode))
+summary(winddir_location_mes)
+```
+
+Será utilizado a direção do vento mais frequente naquela região dentro do dado mês como substituição para os valores faltantes.
+```{r}
+
+names(winddir_location_mes)[-c(1,2)] = paste0("Mode_",names(winddir_location_mes)[-c(1,2)])
+wind_data = wind_data %>% mutate(Mes = month(wind_data$date))
+
+wind_data_clean_1 = wind_data %>% left_join(winddir_location_mes, by = c("location","Mes")) %>% 
+        mutate(wind_gustdir = coalesce(wind_gustdir, Mode_wind_gustdir),
+               wind_dir9am = coalesce(wind_dir9am, Mode_wind_dir9am),
+               wind_dir3pm = coalesce(wind_dir3pm, Mode_wind_dir3pm)) %>% select(-contains("Mode_"))
+
+
+
+```
+
+
+Para as velocidades utilizarei o valor mensal para cada localidade como substituição para os valores faltantes.
+```{r warning=F}
+
+windspd_gust_location_mes = wind_data_clean_1 %>% group_by(location,Mes,wind_gustdir) %>% 
+        summarise(Media_wind_gustspeed = mean(wind_gustspeed,na.rm = T))
+
+wind_data_clean_2 = wind_data_clean_1 %>% left_join(windspd_gust_location_mes, by = c("location","Mes","wind_gustdir")) %>% 
+                                        mutate(wind_gustspeed = coalesce(wind_gustspeed, Media_wind_gustspeed)) %>% 
+                                        select(-Media_wind_gustspeed)
+
+
+windspd_9am_location_mes = wind_data_clean_1 %>% group_by(location,Mes,wind_dir9am) %>% 
+        summarise(Media_wind_speed9am = mean(wind_speed9am,na.rm = T))
+
+wind_data_clean_3 = wind_data_clean_2 %>% left_join(windspd_9am_location_mes, by = c("location","Mes","wind_dir9am")) %>% 
+                                        mutate(wind_speed9am = coalesce(wind_speed9am, Media_wind_speed9am)) %>% 
+                                        select(-Media_wind_speed9am)
+
+windspd_3pm_location_mes = wind_data_clean_1 %>% group_by(location,Mes,wind_dir3pm) %>% 
+        summarise(Media_wind_speed3pm = mean(wind_speed3pm,na.rm = T))
+
+wind_data_clean_4 = wind_data_clean_3 %>% left_join(windspd_3pm_location_mes, by = c("location","Mes","wind_dir3pm")) %>% 
+                                        mutate(wind_speed3pm = coalesce(wind_speed3pm, Media_wind_speed3pm)) %>% 
+                                        select(-Media_wind_speed3pm)
+
+```
+
+Todos os valores com exceção dos sobre o vento mais forte foram preenchidos dos dados sobre ventos.
+```{r}
+
+summary(wind_data_clean_4)
+
+```
+
+
+Realizando join da tabela principal com a de vento e verificando que as colunas que ainda possuem NA são: evaporation,
+sunshine, pressure9am, pressure3pm, cloud9am, cloud3pm, wind_gustdir e wind_gustspeed
+```{r}
+wind_data_clean_4 = wind_data_clean_4 %>% select(-Mes)
+
+rain_wind_data = rain_data_clean_1 %>% left_join(wind_data_clean_4, by = c("location","date"))
+
+summary(rain_wind_data)
+
+```
+
+## Clustering
+
+Antes de utilizar a clusterização para preencher os dados faltantes, irei realizar uma clusterização utilizado somente os dados de coordenadas (externos) para a criação de uma noção de proximidade física das localidades. Utilizando o método de cotovelo, foi selecionado o número 4 de clusters.
+```{r warning=F, message=F}
+
+data = coords[,-1]
+
+elbow(data,20)
+
+mod_kmeans = kmeans(data, 4, nstart=50,iter.max = 15 )
+
+rownames(data) <- paste0(coords$city)
+
+fviz_cluster(mod_kmeans, data = data)
+
+coords$Grupo_Prox = as.factor(mod_kmeans$cluster)
+
+rain_wind_data_coords = rain_wind_data %>% left_join(coords, by=c("location"="city"))
+
+pal <- colorFactor(c("blue","yellow","green","red","purple","black"), domain = levels(coords$Grupo_Prox))
+
+leaflet(coords) %>% addProviderTiles(providers$OpenTopoMap) %>%  addCircleMarkers(lng = ~lng, lat = ~lat, color = ~pal(Grupo_Prox), stroke = FALSE,fillOpacity = .8, popup = ~city) %>% addLegend("topright", pal = pal, values = ~Grupo_Prox,
+    title = "Grupo Proximidade",
+    labFormat = labelFormat(prefix = ""),
+    opacity = 1
+  )
+
+
+```
+
+Agora será realizado uma clusterização com as colunas que não possuem NA, para encontrar regiões com comportamento parecido na esperança de utilizar a média mensal desses clusters para preencher os NA restantes, sob a hipótese de que esses clusters possam agregar da melhor forma possível regiões semelhantes. Esses clusters criados não serão utilizados para propósito de modelagem para evitar redundância.
+```{r warning=F, message=F}
+
+cols_sem_na = c("location","mintemp", "maxtemp", "rainfall", "humidity9am", "humidity3pm", "temp9am", "temp3pm", 
+                "amountOfRain", "temp", "humidity", "precipitation3pm", "precipitation9am", "wind_dir9am", "wind_dir3pm", 
+                "wind_speed9am", "wind_speed3pm","lat","lng")
+
+df_clust = rain_wind_data_coords[,cols_sem_na]
+
+df_clust$wind_dir3pm = as.character(df_clust$wind_dir3pm)
+df_clust$wind_dir9am = as.character(df_clust$wind_dir9am)
+
+df_clust = df_clust %>% group_by(location) %>% 
+                    summarise_all(funs(if(is.numeric(.)) mean(., na.rm = TRUE) else getmode(.)))
+
+
+df_clust$wind_dir3pm = as.factor(df_clust$wind_dir3pm)
+df_clust$wind_dir9am = as.factor(df_clust$wind_dir9am)
+
+df_clust_prep = df_clust %>% mutate_if(is.numeric,scale)
+
+data = model.matrix(location~.,df_clust_prep)[,-1]
+
+elbow(data,20)
+
+#Escolhido 5 clusters
+
+mod_kmeans = kmeans(data, 5, nstart=50,iter.max = 15 )
+
+rownames(data) <- paste0(df_clust$location)
+
+fviz_cluster(mod_kmeans, data = data)
+
+df_clust$Cluster = as.factor(mod_kmeans$cluster)
+
+pal <- colorFactor(c("blue","yellow","green","red","purple","black"), domain = levels(df_clust$Cluster))
+
+leaflet(df_clust) %>% addProviderTiles(providers$OpenTopoMap) %>%  addCircleMarkers(lng = ~lng, lat = ~lat, color = ~pal(Cluster), stroke = FALSE,fillOpacity = .8, popup = ~location) %>% addLegend("topright", pal = pal, values = ~Cluster,
+    title = "Cluster",
+    labFormat = labelFormat(prefix = ""),
+    opacity = 1
+  )
+
+rain_wind_data_cl = rain_wind_data_coords %>% left_join(df_clust %>% select(location,Cluster),by="location")
+
+
+```
+
+Agora o agrupamento será realizado a partir dos clusters encontrados ao invés da localização e a partir do mês. Criação de uma variável com a variação de temperatura do dia.
+```{r warning=F, message=F}
+
+
+clust_loc = rain_wind_data_cl %>% group_by(Cluster,Mes) %>% 
+                             summarise(Var_evaporation = mean(evaporation, na.rm = T),
+                                       Var_sunshine = mean(sunshine, na.rm = T),
+                                       Var_pressure9am = mean(pressure9am, na.rm = T),
+                                       Var_pressure3pm = mean(pressure3pm, na.rm = T),
+                                       Var_cloud9am = mean(cloud9am, na.rm = T),
+                                       Var_cloud3pm = mean(cloud3pm, na.rm = T),
+                                       Var_wind_gustdir = getmode(wind_gustdir),
+                                       Var_wind_gustspeed = mean(wind_gustspeed, na.rm = T),
+                                       Var_raintoday = getmode(raintoday))
+
+
+rain_wind_data_final = rain_wind_data_cl %>% left_join(clust_loc, by = c("Cluster","Mes")) %>% 
+                                        mutate(evaporation = coalesce(evaporation,Var_evaporation),
+                                                  sunshine = coalesce(sunshine,Var_sunshine),
+                                                  pressure9am = coalesce(pressure9am,Var_pressure9am),
+                                                  pressure3pm = coalesce(pressure3pm,Var_pressure3pm),
+                                                  cloud9am = coalesce(cloud9am,Var_cloud9am),
+                                                  cloud3pm = coalesce(cloud3pm,Var_cloud3pm),
+                                                  wind_gustdir =coalesce(wind_gustdir,Var_wind_gustdir),
+                                                  wind_gustspeed =
+                                                  coalesce(wind_gustspeed,Var_wind_gustspeed),
+                                                  raintoday = coalesce(raintoday,Var_raintoday)) %>%
+                                        select(-contains("Var_"),-Cluster)
+
+
+
+rain_wind_data_final = rain_wind_data_final %>% mutate(Var_Temp = maxtemp - mintemp)
+```
+
+Preenchendo assim todos os dados faltantes que restavam.
+```{r}
+summary(rain_wind_data_final)
+```
+
+# Modelagem
+
+Divisão dos dados em treino (80%), teste (10%) e validação(10%)
+```{r}
+
+rain_wind_data_final$raintoday = ifelse(rain_wind_data_final$raintoday == "Yes",1,0)
+
+set.seed(1234)
+#part = createDataPartition(rain_wind_data_final$raintomorrow,p=.8,list = F)
+
+rain_wind_data_final$raintomorrow = as.factor(ifelse(rain_wind_data_final$raintomorrow=="Yes",1,0))
+
+rain_wind_data_final$location = as.factor(rain_wind_data_final$location)
+
+train = rain_wind_data_final[part,]
+test = rain_wind_data_final[-part,]
+
+set.seed(1234)
+#part_val = createDataPartition(test$raintomorrow,p=.5,list = F)
+
+validation = test[part_val,]
+test = test[-part_val,]
+
+trainctrl <- trainControl(verboseIter = TRUE,method="cv", number=3,allowParallel = TRUE)
+
+```
+
+Criação da variável Choveu_Grupo, que verifica se em alguma das localidades do grupo de proximidade houve relato de chuva naquele dia. Criação dessa variável nos dados de treino, para evitar overfitting.
+```{r}
+
+
+chuva_prox = train %>% group_by(Grupo_Prox,date) %>% 
+                                  summarise(Choveu_Grupo = as.factor(max(raintoday,na.rm = T)))
+
+train$raintoday = as.factor(train$raintoday)
+
+train = train %>% left_join(chuva_prox)
+
+train$Choveu_Grupo = as.factor(train$Choveu_Grupo)
+
+
+
+prop.table(table(Chove_Amanha = train$raintomorrow,Choveu_Proximo = train$Choveu_Grupo),margin=1)
+
+prep = preProcess(train,c('center','scale'))
+
+train = predict(prep,train)
+
+test = test %>% left_join(chuva_prox)
+test$Choveu_Grupo[is.na(test$Choveu_Grupo)] = 0
+test$Choveu_Grupo = as.factor(test$Choveu_Grupo)
+test$raintoday = as.factor(test$raintoday)
+
+test = predict(prep,test)
+
+```
+Podemos notar que aproximadamente 80% das vezes que chove no dia seguinte, houve alguma chuva dentro do grupo de proximidade.
+</br>
+
+Como a variável resposta é muito desbalanceada, utilizarei um método de up sampling para equilibrá-la.
+```{r}
+sim = train[train$raintomorrow==1,]
+nao = train[!train$raintomorrow==1,]
+
+set.seed(1234)
+#samp_sim = sample(nrow(sim),50000,replace = T)
+setset.seed(1234)
+#samp_nao = sample(nrow(nao),50000,replace = F)
+
+train_bal = rbind(sim[samp_sim,],nao[samp_nao,])
+
+```
+
+
+Seleção das variáveis que serão utilizadas na composição do modelo inicial.
+```{r}
+
+vars_modelo = c("location", "mintemp", "maxtemp", "rainfall", "evaporation", "sunshine",        
+"humidity9am", "humidity3pm", "pressure9am", "pressure3pm", "cloud9am", "cloud3pm", "temp9am",         
+"temp3pm", "raintoday", "temp", "humidity", "precipitation3pm", "precipitation9am", "Mes", "wind_gustdir", "wind_gustspeed", "wind_dir9am", "wind_dir3pm", "wind_speed9am", "wind_speed3pm", "Grupo_Prox", "Var_Temp", "Choveu_Grupo", "raintomorrow")
+
+train_bal = train_bal[,vars_modelo]
+
+train = train[,vars_modelo]
+```
+
+
+## Arvore de Decisão
+
+```{r}
+
+#model_rpart = train(raintomorrow~.,train_bal,"rpart",tuneLength = 3,trControl = trainctrl)
+
+pred_rpart = predict(model_rpart,test)
+
+confusionMatrix(pred_rpart,test$raintomorrow)
+
+aux_rpart = rocp(model_rpart,test,test$raintomorrow)
+acc_rpart = confusionMatrix(pred_rpart,test$raintomorrow)$overall[1]
+
+plot_density_pred(model_rpart,test)
+
+teste = predict(model_rpart,test,"prob")[,2]
+teste2 = as.factor(ifelse(teste>.3,1,0))
+
+confusionMatrix(teste2,test$raintomorrow)
+
+
+```
+
+## Regressão Logística
+
+```{r warning =F}
+
+#model_logistic = train(raintomorrow~.,train_bal,"glm",family="binomial")
+
+pred_logistic = predict(model_logistic,test)
+
+confusionMatrix(pred_logistic,test$raintomorrow)
+
+aux_logistic = rocp(model_logistic,test,test$raintomorrow)
+acc_logistic = confusionMatrix(pred_logistic,test$raintomorrow)$overall[1]
+
+plot_density_pred(model_logistic,test)
+
+```
+
+## XGBoost
+
+```{r}
+
+#model_xgb = train(raintomorrow~.,train_bal,"xgbTree",tuneLength = 3,trControl = trainctrl)
+
+pred_xgb = predict(model_xgb,test)
+
+confusionMatrix(pred_xgb,test$raintomorrow)
+
+aux_xgb = rocp(model_xgb,test,test$raintomorrow)
+acc_xgb = confusionMatrix(pred_xgb,test$raintomorrow)$overall[1]
+
+plot_density_pred(model_xgb,test)
+
+```
+
+## Conditional Tree
+
+```{r}
+
+#model_ctree = train(raintomorrow~.,train_bal,"ctree",tuneLength = 3,trControl = trainctrl)
+
+pred_ctree = predict(model_ctree,test)
+
+confusionMatrix(pred_ctree,test$raintomorrow)
+
+auc_ctree = rocp(model_ctree,test,test$raintomorrow)
+acc_ctree = confusionMatrix(pred_ctree,test$raintomorrow)$overall[1]
+
+plot_density_pred(model_ctree,test)
+
+```
+
+## XGBoost Amostra Desbalanceada
+
+O XGBoost possui um hiperparâmetro específico para lidar com amostras desbalanceadas chamado scale_pos_weight, o valor recomendado para elé número de amostras negativas/número de amostras positivas.
+
+```{r}
+
+#mod_xgb_weighted = train(raintomorrow~. ,train,"xgbTree", tuneLength = 3,trControl = trainctrl, scale_pos_weight = 3.46)
+
+pred_xgb_weighted = predict(mod_xgb_weighted,test)
+
+confusionMatrix(pred_xgb_weighted,test$raintomorrow)
+
+auc_xgb_weighted=rocp(mod_xgb_weighted,test,test$raintomorrow)
+acc_xgb_weighted = confusionMatrix(pred_xgb_weighted,test$raintomorrow)$overall[1]
+
+plot_density_pred(mod_xgb_weighted,test)
+
+```
+
+
+## Random Forest
+
+```{r}
+
+#mod_rf = train(raintomorrow~. ,train_bal,"rf", tuneLength = 3,trControl = trainctrl)
+
+pred_rf = predict(mod_rf,test)
+
+confusionMatrix(pred_rf,test$raintomorrow)
+
+auc_rf = rocp(mod_rf,test,test$raintomorrow)
+acc_rf = confusionMatrix(pred_rf,test$raintomorrow)$overall[1]
+
+plot_density_pred(mod_rf,test)
+
+```
+
+## Tuning XGBoost
+
+Na tentativa de melhorar a performance do modelo do XGBoost, será realizado um tuning dos seus hiperparâmetros.
+
+```{r}
+nrounds <- 1000
+tune_grid <- expand.grid(
+  nrounds = seq(from = 200, to = nrounds, by = 50),
+  eta = c(0.025, 0.05, 0.1, 0.3),
+  max_depth = c(2, 3, 4, 5, 6),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+trainctrl <- trainControl(verboseIter = TRUE,method="cv", number=3)
+#tune_xgb1 = train(raintomorrow~.,train_bal,"xgbTree",trControl = trainctrl,tuneGrid = tune_grid)
+
+
+ggplot(tune_xgb1) + theme_bw() + ylim(c(min(tune_xgb1$results$Accuracy),1))
+
+```
+
+
+```{r}
+
+maxd = tune_xgb1$bestTune$max_depth
+
+tune_grid2 <- expand.grid(
+  nrounds = seq(from = 50, to = nrounds, by = 50),
+  eta = tune_xgb1$bestTune$eta,
+  max_depth = c((maxd-1):(maxd+1)),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = c(1, 2, 3),
+  subsample = 1
+)
+
+#tune_xgb2 = train(raintomorrow~.,train_bal,"xgbTree",trControl = trainctrl,tuneGrid = tune_grid2)
+
+ggplot(tune_xgb2) + theme_bw() + ylim(c(min(tune_xgb2$results$Accuracy),1))
+
+```
+
+
+```{r}
+
+tune_grid3 <- expand.grid(
+  nrounds = seq(from = 50, to = nrounds, by = 50),
+  eta = tune_xgb1$bestTune$eta,
+  max_depth = 6,
+  gamma = 0,
+  colsample_bytree = c(0.4, 0.6, 0.8, 1.0),
+  min_child_weight = tune_xgb2$bestTune$min_child_weight,
+  subsample = c(0.5, 0.75, 1.0)
+)
+
+#tune_xgb3 = train(raintomorrow~.,train_bal,"xgbTree",trControl = trainctrl,tuneGrid = tune_grid3)
+
+ggplot(tune_xgb3) + theme_bw() + ylim(c(min(tune_xgb3$results$Accuracy),1))
+
+```
+
+```{r}
+
+
+tune_grid4 <- expand.grid(
+  nrounds = seq(from = 50, to = nrounds, by = 50),
+  eta = tune_xgb1$bestTune$eta,
+  max_depth = 6,
+  gamma = c(0, 0.05, 0.1, 0.5, 0.7, 0.9, 1.0),
+  colsample_bytree = tune_xgb3$bestTune$colsample_bytree,
+  min_child_weight = tune_xgb2$bestTune$min_child_weight,
+  subsample = tune_xgb3$bestTune$subsample
+)
+#tune_xgb4 = train(raintomorrow~.,train_bal,"xgbTree",trControl = trainctrl,tuneGrid = tune_grid4)
+
+ggplot(tune_xgb4) + theme_bw() + ylim(c(min(tune_xgb4$results$Accuracy),1))
+```
+```{r}
+
+tune_grid5 <- expand.grid(
+  nrounds = seq(from = 100, to = 10000, by = 100),
+  eta = c(0.01, 0.015, 0.025, 0.05, 0.1),
+  max_depth = 6,
+  gamma = tune_xgb4$bestTune$gamma,
+  colsample_bytree = tune_xgb3$bestTune$colsample_bytree,
+  min_child_weight = tune_xgb2$bestTune$min_child_weight,
+  subsample = tune_xgb3$bestTune$subsample
+)
+
+#tune_xgb5 = train(raintomorrow~.,train_bal,"xgbTree",trControl = trainctrl,tuneGrid = tune_grid5)
+
+ggplot(tune_xgb5) + theme_bw() + ylim(c(min(tune_xgb5$results$Accuracy),1))
+
+```
+
+```{r}
+
+final_grid <- expand.grid(
+  nrounds = 2800,
+  eta = 0.1,
+  max_depth = 6,
+  gamma = tune_xgb5$bestTune$gamma,
+  colsample_bytree = tune_xgb5$bestTune$colsample_bytree,
+  min_child_weight = tune_xgb5$bestTune$min_child_weight,
+  subsample = tune_xgb5$bestTune$subsample)
+
+#mod_xgb_tuned = train(raintomorrow~.,train_bal,"xgbTree",trControl = trainctrl,tuneGrid = final_grid)
+
+pred_xgb_tuned = predict(mod_xgb_tuned,test)
+
+confusionMatrix(pred_xgb_tuned,test$raintomorrow)
+
+auc_xgb_tuned = rocp(mod_xgb_tuned,test,test$raintomorrow)
+acc_xgb_tuned = confusionMatrix(pred_xgb_tuned,test$raintomorrow)$overall[1]
+
+plot_density_pred(mod_xgb_tuned,test)
+```
+
+
+## Comparativo
+```{r}
+
+accs = c(acc_rpart,acc_logistic,acc_xgb,acc_ctree,acc_xgb_weighted,acc_rf, acc_xgb_tuned)
+aucs = c(aux_rpart[[1]],aux_logistic[[1]],aux_xgb[[1]],auc_ctree[[1]],auc_xgb_weighted[[1]],auc_rf[[1]],auc_xgb_tuned[[1]])
+
+
+df = data.frame(Modelo = c("Decision Tree",
+                           "Logistic Regression",
+                           "XGBoost","Conditional Tree",
+                           "XGBoost Unbalanced", "Random Forest", "XGBoost Tuned"), Accuracy=accs,AUC=aucs)
+
+
+df
+
+```
+
+
+```{r warning=F}
+
+preds_list = list(predict(model_rpart,test,"prob")[,2],
+          predict(model_logistic,test,"prob")[,2],
+          predict(model_xgb,test,"prob")[,2],
+          predict(model_ctree,test,"prob")[,2],
+          predict(mod_xgb_weighted,test,"prob")[,2],
+          predict(mod_rf,test,"prob")[,2],
+          predict(mod_xgb_tuned,test,"prob")[,2])
+m <- length(preds_list)
+actuals_list <- rep(list(test$raintomorrow), m)
+
+pred <- prediction(preds_list, actuals_list)
+rocs <- performance(pred, "tpr", "fpr")
+plot(rocs, col = as.list(1:m), main = "Test Set ROC Curves")
+legend(x = "bottomright", 
+       legend = c("Decision Tree",
+                           "Logistic Regression",
+                           "XGBoost","Conditional Tree",
+                           "XGBoost Unbalanced", "Random Forest","XGBoost Tuned"),
+       fill = 1:m)
+
+```
+
+O modelo escohido foi XGBoost Tuned, o método de seleção foi o AUC. O ponto de corte foi alterado para 0.35, atingindo assim as seguintes métricas para a base de validação.
+
+
+
+```{r}
+
+validation = validation %>% left_join(chuva_prox)
+validation$Choveu_Grupo[is.na(validation$Choveu_Grupo)] = 0
+validation$Choveu_Grupo = as.factor(validation$Choveu_Grupo)
+validation$raintoday = as.factor(validation$raintoday)
+
+validation = predict(prep,validation)
+
+pred_thresh = predict(mod_xgb_tuned,validation,"prob")[,2]
+pred_thresh = as.factor(ifelse(pred_thresh>.35,1,0))
+
+confusionMatrix(pred_thresh,validation$raintomorrow)
+
+
+```
+
+
+# Conclusão
+
+O modelo escolhido possui um resultado satisfatório, entretanto necessita melhora para o caso dos falsos positivos.
