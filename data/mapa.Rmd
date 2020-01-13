@@ -1,0 +1,441 @@
+---
+title: "Case Itau"
+author: "Tiago Araujo"
+date: "1/6/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Libs e wd
+```{r message=F}
+library(tidyverse)
+library(factoextra)
+library(lubridate)
+library(caret)
+
+getmode <- function(v) {
+   uniqv <- unique(v[which(!is.na(v))])
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+```
+
+
+Leitura dos dados
+```{r message=F}
+setwd("./processo_cientista-master/data")
+rain_data <- read_csv("rain_data_aus.csv", 
+                        col_types = cols(evaporation = col_double(), 
+                        sunshine = col_double()))
+
+for(i in 1:8){
+        file = paste0("wind_table_0",i,".csv")
+        if(i==1){
+                wind_data = read_csv(file)
+                cols = names(wind_data)
+        }
+        else{
+                aux = read_csv(file)
+                names(aux) = cols
+                wind_data = rbind(wind_data,aux)
+        }
+}
+
+
+```
+
+
+Correções no datatype das colunas character
+```{r}
+rain_data$location = factor(rain_data$location)
+rain_data$raintoday = factor(rain_data$raintoday)
+rain_data$raintomorrow = factor(rain_data$raintomorrow)
+summary(rain_data)
+
+```
+
+```{r}
+sum(is.na(rain_data))
+```
+
+
+Distribuição da variável resposta, bastante desbalanceado
+```{r}
+
+ggplot(rain_data,aes(raintomorrow)) + geom_bar() + theme_bw() + ylab("Contagem")
+
+
+```
+
+A primeira vista o fato de ter chovido hoje, influencia bastante se chove ou não amanha
+```{r}
+
+ggplot(rain_data,aes(raintoday, fill = raintomorrow)) + geom_bar(position = "dodge") + theme_bw() + ylab("Contagem")
+
+```
+
+
+Variável de quantidade de chuva parece redundante com o fato de ter chovido ou não hoje, mas aparentemente a quantidade de chuva tem uma influencia para o resultado de amanha
+```{r}
+
+rain_data %>% filter(raintoday=="Yes") %>% ggplot(aes(y=amountOfRain,x=raintomorrow)) + geom_boxplot() + theme_bw()
+
+
+
+
+```
+
+
+As localizações aparentemente distribuem bem a variável resposta
+```{r}
+
+ggplot(rain_data,aes(location, fill = raintomorrow)) + geom_bar(position = "dodge") + theme_bw() + ylab("Contagem") + theme(axis.text.x = element_text(angle = 90))
+
+
+```
+
+As outras variáveis possuem um número considerável de NA, seria necessário tratá-las. Utilizarei a média mensal ao longo dos anos naqueles mes específico para dada localidade
+```{r}
+
+medias_mes_local = rain_data %>% group_by(location,Mes = month(date)) %>%
+                   summarise_at(vars(mintemp:temp3pm,"temp","humidity"),funs(mean(.,na.rm = T)))
+
+names(medias_mes_local)[-c(1,2)] = paste0("Media_",names(medias_mes_local)[-c(1,2)])
+
+rain_data = rain_data %>% mutate(Dia = day(date), Mes = month(date), Ano = year(date))
+
+rain_data_clean_1 = rain_data %>% left_join(medias_mes_local, by = c("location","Mes")) %>% 
+        mutate(mintemp = coalesce(mintemp, Media_mintemp),
+               maxtemp = coalesce(maxtemp, Media_maxtemp),
+               rainfall = coalesce(rainfall, Media_rainfall),
+               evaporation = coalesce(evaporation, Media_evaporation),
+               sunshine = coalesce(sunshine, Media_sunshine),
+               humidity9am = coalesce(humidity9am, Media_humidity9am),
+               humidity3pm = coalesce(humidity3pm, Media_humidity3pm),
+               pressure9am = coalesce(pressure9am, Media_pressure9am),
+               pressure3pm = coalesce(pressure3pm, Media_pressure3pm),
+               cloud9am = coalesce(cloud9am, Media_cloud9am),
+               cloud3pm = coalesce(cloud3pm, Media_cloud3pm),
+               temp9am = coalesce(temp9am, Media_temp9am),
+               temp3pm = coalesce(temp3pm, Media_temp3pm),
+               temp = coalesce(temp, Media_temp),
+               humidity = coalesce(humidity, Media_humidity)) %>% select(-contains("Media_"))
+
+```
+
+Redução de quase 100 mil NA
+```{r}
+
+sum(is.na(rain_data_clean_1))
+
+```
+
+Os campos que continuam com NA, não obtiveram nenhuma medida da variável dentro daquela cidade no período todo 
+```{r}
+summary(rain_data_clean)
+```
+
+
+Tratativa dos dados de vento para realizar um join com a tabela principal com intuito de obter mais informações para tratar os NA restantes
+
+```{r}
+
+summary(wind_data)
+```
+
+Existem dias com mais de uma observação para a mesma cidade
+```{r}
+dup = wind_data %>% group_by(location,date) %>% count()
+
+table(dup$n)
+
+
+
+```
+
+As repetições são linhas duplicadas pois a quantidade de linhas duplicadas e do conjunto location/date que se repetem é a mesma
+```{r}
+
+sum(duplicated(wind_data))
+
+
+```
+
+Removendo as linhas duplicadas
+
+```{r}
+
+wind_data = wind_data[!duplicated(wind_data),]
+
+
+```
+
+
+Para os campos onde a velocidade do vento é zero, irei substituir NA por X
+```{r}
+
+
+wind_data$wind_gustdir[wind_data$wind_gustspeed==0] = "X"
+wind_data$wind_dir9am[wind_data$wind_speed9am==0] = "X"
+wind_data$wind_dir3pm[wind_data$wind_speed3pm==0] = "X"
+
+
+```
+
+```{r}
+
+summary(wind_data)
+
+```
+
+
+```{r}
+sum(is.na(wind_data))
+```
+
+
+Existem 2 cidades que não possuem nenhuma informação sobre wind_gustdir
+```{r}
+
+wind_data$location = as.factor(wind_data$location)
+wind_data$wind_gustdir = as.factor(wind_data$wind_gustdir)
+wind_data$wind_dir9am = as.factor(wind_data$wind_dir9am)
+wind_data$wind_dir3pm = as.factor(wind_data$wind_dir3pm)
+
+winddir_location_mes = wind_data %>% group_by(location,Mes = month(date)) %>% summarise_at(vars(contains("dir")),funs(getmode))
+summary(winddir_location_mes)
+```
+
+```{r}
+
+names(winddir_location_mes)[-c(1,2)] = paste0("Mode_",names(winddir_location_mes)[-c(1,2)])
+wind_data = wind_data %>% mutate(Mes = month(wind_data$date))
+
+wind_data_clean_1 = wind_data %>% left_join(winddir_location_mes, by = c("location","Mes")) %>% 
+        mutate(wind_gustdir = coalesce(wind_gustdir, Mode_wind_gustdir),
+               wind_dir9am = coalesce(wind_dir9am, Mode_wind_dir9am),
+               wind_dir3pm = coalesce(wind_dir3pm, Mode_wind_dir3pm)) %>% select(-contains("Mode_"))
+
+
+
+```
+
+```{r}
+
+sum(is.na(wind_data_clean_1))
+
+summary(wind_data_clean_1)
+```
+
+```{r}
+
+windspd_9am_location_mes = wind_data_clean_1 %>% group_by(location,Mes,wind_dir9am) %>% 
+        summarise(Media_wind_speed9am = mean(wind_speed9am,na.rm = T))
+
+wind_data_clean_2 = wind_data_clean_1 %>% left_join(windspd_9am_location_mes, by = c("location","Mes","wind_dir9am")) %>% 
+                                        mutate(wind_speed9am = coalesce(wind_speed9am, Media_wind_speed9am)) %>% 
+                                        select(-Media_wind_speed9am)
+```
+
+
+
+```{r}
+
+windspd_3pm_location_mes = wind_data_clean_1 %>% group_by(location,Mes,wind_dir3pm) %>% 
+        summarise(Media_wind_speed3pm = mean(wind_speed3pm,na.rm = T))
+
+wind_data_clean_3 = wind_data_clean_2 %>% left_join(windspd_3pm_location_mes, by = c("location","Mes","wind_dir3pm")) %>% 
+                                        mutate(wind_speed3pm = coalesce(wind_speed3pm, Media_wind_speed3pm)) %>% 
+                                        select(-Media_wind_speed3pm)
+
+```
+
+
+```{r}
+
+summary(wind_data_clean_3)
+
+```
+
+
+Realizando join da tabela principal com a de vento e verificando que as colunas que ainda possuem NA são: evaporation,
+sunshine, pressure9am, pressure3pm, cloud9am, cloud3pm, wind_gustdir e wind_gustspeed
+```{r}
+wind_data_clean_3 = wind_data_clean_3 %>% select(-Mes)
+
+rain_wind_data = rain_data_clean_1 %>% left_join(wind_data_clean_3, by = c("location","date"))
+
+summary(rain_wind_data)
+
+```
+
+
+```{r}
+
+coords = read_csv("city_coord.csv")
+
+rain_wind_data_coords = rain_wind_data %>% left_join(coords, by=c("location"="city"))
+
+```
+
+
+
+Criação de clusters com as colunas que não possuem NA, para encontrar regiões com comportamento parecido na esperança de utilizar a média mensal desses clusters para preencher os NA restantes
+```{r}
+
+
+
+cols_sem_na = c("location","mintemp", "maxtemp", "rainfall", "humidity9am", "humidity3pm", "temp9am", "temp3pm", 
+                "amountOfRain", "temp", "humidity", "precipitation3pm", "precipitation9am", "wind_dir9am", "wind_dir3pm", 
+                "wind_speed9am", "wind_speed3pm","lat","lng")
+
+df_clust = rain_wind_data_coords[,cols_sem_na]
+
+df_clust$wind_dir3pm = as.character(df_clust$wind_dir3pm)
+df_clust$wind_dir9am = as.character(df_clust$wind_dir9am)
+
+df_clust = df_clust %>% group_by(location) %>% 
+                    summarise_all(funs(if(is.numeric(.)) mean(., na.rm = TRUE) else getmode(.)))
+
+
+df_clust$wind_dir3pm = as.factor(df_clust$wind_dir3pm)
+df_clust$wind_dir9am = as.factor(df_clust$wind_dir9am)
+
+df_clust_prep = df_clust %>% mutate_if(is.numeric,scale)
+
+k.max <- 20
+data <- model.matrix(location~.,df_clust_prep)[,-1]
+wss <- sapply(1:k.max, 
+              function(k){kmeans(data, k, nstart=50,iter.max = 15 )$tot.withinss})
+wss
+plot(1:k.max, wss,
+     type="b", pch = 19, frame = FALSE, 
+     xlab="Number of clusters K",
+     ylab="Total within-clusters sum of squares")
+
+#Escolhido 5 clusters
+
+mod_kmeans = kmeans(data, 5, nstart=50,iter.max = 15 )
+
+rownames(data) <- paste0(df_clust$location)
+
+fviz_cluster(mod_kmeans, data = data)
+
+df_clust$Cluster = as.factor(mod_kmeans$cluster)
+
+
+
+```
+
+
+```{r}
+
+library(leaflet)
+library(viridisLite)
+
+
+pal <- colorFactor(c("blue","yellow","green","red","purple","black"), domain = levels(df_clust$Cluster))
+
+m <- leaflet(df_clust) %>% addTiles() %>%  addCircleMarkers(lng = ~lng, lat = ~lat, color = ~pal(Cluster), stroke = FALSE,fillOpacity = .8, popup = ~location) %>% addLegend("topright", pal = pal, values = ~Cluster,
+    title = "Cluster",
+    labFormat = labelFormat(prefix = "$"),
+    opacity = 1
+  )
+
+```
+
+
+```{r}
+
+rain_wind_data_cl = rain_wind_data %>% left_join(df_clust %>% select(location,Cluster),by="location")
+
+summary(rain_wind_data_cl)
+
+```
+
+
+
+
+```{r}
+
+
+clust_loc = rain_wind_data_cl %>% group_by(Cluster,Mes) %>% 
+                             summarise(Var_evaporation = mean(evaporation, na.rm = T),
+                                       Var_sunshine = mean(sunshine, na.rm = T),
+                                       Var_pressure9am = mean(pressure9am, na.rm = T),
+                                       Var_pressure3pm = mean(pressure3pm, na.rm = T),
+                                       Var_cloud9am = mean(cloud9am, na.rm = T),
+                                       Var_cloud3pm = mean(cloud3pm, na.rm = T),
+                                       Var_wind_gustdir = getmode(wind_gustdir),
+                                       Var_wind_gustspeed = mean(wind_gustspeed, na.rm = T),
+                                       Var_raintoday = getmode(raintoday))
+
+
+rain_wind_data_final = rain_wind_data_cl %>% left_join(clust_loc, by = c("Cluster","Mes")) %>% 
+                                        mutate(evaporation = coalesce(evaporation,Var_evaporation),
+                                                  sunshine = coalesce(sunshine,Var_sunshine),
+                                                  pressure9am = coalesce(pressure9am,Var_pressure9am),
+                                                  pressure3pm = coalesce(pressure3pm,Var_pressure3pm),
+                                                  cloud9am = coalesce(cloud9am,Var_cloud9am),
+                                                  cloud3pm = coalesce(cloud3pm,Var_cloud3pm),
+                                                  wind_gustdir =coalesce(wind_gustdir,Var_wind_gustdir),
+                                                  wind_gustspeed =
+                                                  coalesce(wind_gustspeed,Var_wind_gustspeed),
+                                                  raintoday = coalesce(raintoday,Var_raintoday)) %>%
+                                        select(-contains("Var_"))
+
+
+
+
+```
+
+```{r}
+
+
+part = createDataPartition(rain_wind_data_final$raintomorrow,p=.8,list = F)
+
+train = rain_wind_data_final[part,]
+test = rain_wind_data_final[-part,]
+
+sim = train[train$raintomorrow=="Yes",]
+nao = train[!train$raintomorrow=="Yes",]
+
+samp_sim = sample(nrow(sim),40000,replace = T)
+samp_nao = sample(nrow(nao),40000,replace = F)
+
+train_bal = rbind(sim[samp_sim,],nao[samp_nao,])
+
+trainctrl <- trainControl(verboseIter = TRUE,method="cv", number=10)
+mod = train(raintomorrow~. -date -Mes -Ano -Cluster -Dia -modelo_vigente -amountOfRain,train_bal,"xgbTree",
+            tuneLength = 5,trControl = trainctrl)
+
+
+pred = predict(mod,train)
+
+ggplot() + geom_density(aes(pred,col = train$raintomorrow))
+
+confusionMatrix(pred,train$raintomorrow)
+
+pred_deles = factor(ifelse(rain_data$modelo_vigente>.5,"Yes","No"))
+
+
+confusionMatrix(pred_deles,rain_data_clean$raintomorrow)
+
+```
+
+```{r}
+
+
+ggplot(rain_wind_data_final,aes(amountOfRain)) + geom_density()
+
+rain_wind_data_final %>% group_by(raintomorrow) %>% summarise(sum(amountOfRain))
+
+
+
+
+```
+
